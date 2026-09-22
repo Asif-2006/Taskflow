@@ -1,0 +1,24 @@
+# ─── Dependencies ────────────────────────────────
+node_modules/
+
+# ─── Environment variables (NEVER commit real .env)
+.env
+
+# ─── OS files ─────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Editor files ─────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Logs ─────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+
+# ─── Docker ───────────────────────────────────────
+# (Keep docker-compose.yml tracked, but ignore overrides)
+docker-compose.override.yml

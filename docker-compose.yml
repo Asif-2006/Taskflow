@@ -1,0 +1,62 @@
+services:
+  # ─────────────────────────────────────────
+  # Redis — job queue (temporary courier)
+  # MongoDB is hosted on Atlas (cloud), not here.
+  # ─────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: taskflow-redis
+    ports:
+      - "6380:6379"         # Host:6380 → Container:6379 (avoids clash with local Redis)
+    networks:
+      - taskflow-network
+
+  # ─────────────────────────────────────────
+  # API Server — receives job submissions
+  # ─────────────────────────────────────────
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: taskflow-api
+    ports:
+      - "3001:3000"
+    environment:
+      # ${MONGODB_URI} reads from your .env file automatically
+      - MONGODB_URI=${MONGODB_URI}
+      - REDIS_URL=redis://redis:6379
+      - PORT=3000
+    depends_on:
+      - redis
+    networks:
+      - taskflow-network
+    volumes:
+      - ./api:/app
+      - /app/node_modules
+
+  # ─────────────────────────────────────────
+  # Worker — processes jobs from the queue
+  # ─────────────────────────────────────────
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: taskflow-worker
+    environment:
+      - MONGODB_URI=${MONGODB_URI}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    networks:
+      - taskflow-network
+    volumes:
+      - ./worker:/app
+      - /app/node_modules
+
+# ─────────────────────────────────────────
+# Shared network — containers communicate
+# by service name, not localhost
+# ─────────────────────────────────────────
+networks:
+  taskflow-network:
+    driver: bridge
