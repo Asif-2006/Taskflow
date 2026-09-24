@@ -1,528 +1,461 @@
 # TaskFlow — Distributed Job Queue Platform
 
-A minimal but fully working distributed job queue built from scratch using **Node.js**, **Express**, **MongoDB**, and **Redis** — without any queue framework.
+A production-grade, distributed job queue built from scratch using **Node.js**, **Express**, **MongoDB Atlas**, and **Redis** — without any heavy queue framework (no BullMQ, no Celery, no Kafka).
 
 ---
 
 ## 📖 Table of Contents
 
-1. [What is this project?](#what-is-this-project)
-2. [Core Concepts](#core-concepts)
-   - [What is a Job?](#what-is-a-job)
-   - [What is a Queue?](#what-is-a-queue)
-   - [Why do we need a Worker?](#why-do-we-need-a-worker)
-   - [Why Redis?](#why-redis)
-   - [Why MongoDB?](#why-mongodb)
-   - [MongoDB vs Redis — the key distinction](#mongodb-vs-redis--the-key-distinction)
-3. [Architecture](#architecture)
-4. [Job Lifecycle](#job-lifecycle)
-5. [Project Structure](#project-structure)
-6. [Tech Stack](#tech-stack)
-7. [API Documentation](#api-documentation)
-8. [How to Run](#how-to-run)
-9. [How to Test](#how-to-test)
-10. [Example Logs](#example-logs)
-11. [Git Commit Guide](#git-commit-guide)
+1. [What is TaskFlow?](#what-is-taskflow)
+2. [Key Capabilities & Architecture](#key-capabilities--architecture)
+3. [Core Concepts](#core-concepts)
+   - [Job Lifecycle State Machine](#job-lifecycle-state-machine)
+   - [Retries & Exponential Backoff](#retries--exponential-backoff)
+   - [Dead Letter Queue (DLQ) & Requeueing](#dead-letter-queue-dlq--requeueing)
+   - [Priority Queues (Multi-key BRPOP)](#priority-queues-multi-key-brpop)
+   - [Weighted Slot Concurrency & Worker Scaling](#weighted-slot-concurrency--worker-scaling)
+   - [Job Leases & The Crash-Recovery Reaper](#job-leases--the-crash-recovery-reaper)
+   - [Idempotency Keys](#idempotency-keys)
+4. [System Architecture Diagram](#system-architecture-diagram)
+5. [Tech Stack](#tech-stack)
+6. [Project Structure](#project-structure)
+7. [API Reference](#api-reference)
+8. [Configuration & Environment Variables](#configuration--environment-variables)
+9. [How to Run](#how-to-run)
+10. [Testing & Verification Flows](#testing--verification-flows)
 
 ---
 
-## What is this project?
+## What is TaskFlow?
 
-TaskFlow is a **job queue platform** — a system that lets you submit work to be done asynchronously.
+TaskFlow is a **distributed background job processing platform**. It decouples HTTP request handling from time-consuming tasks (video rendering, email dispatching, payment reconciliation, data sync).
 
-**The problem it solves:** Imagine a user uploads a file to your API. If the API processes that file itself before responding, the user waits — sometimes for minutes. Instead, TaskFlow lets the API say "I've received your request" instantly, while a separate Worker handles the heavy work in the background.
+When a client submits work:
+1. The **API Server** stores the job in MongoDB, pushes only the lightweight job ID into Redis, and responds immediately with `201 Accepted`.
+2. One or more **Distributed Worker Containers** (each running a pool of concurrent slots) atomically consume jobs via Redis `BRPOP`, acquire an expiring **lease**, process the payload, and update state in MongoDB.
+3. If any worker process crashes mid-execution, a **Lease Reaper** detects the abandoned job and rescues it.
 
-This is how real-world systems like email delivery, image processing, and video encoding work at scale.
+---
+
+## Key Capabilities & Architecture
+
+| Feature | How It Works |
+|---|---|
+| **Zero Heavy Dependencies** | Built using raw Redis Lists + blocking commands (`BRPOP`, `LPUSH`) and Mongoose. |
+| **Exponential Backoff Retries** | When a job fails, backoff delay = `min(2^retryCount * 1000ms, 30000ms)`. |
+| **Dead Letter Queue (DLQ)** | Jobs exhausting retries transition to `DEAD` and are placed in `taskflow:dead`. |
+| **Manual Requeueing** | `POST /api/jobs/:id/requeue` resets attempts and re-injects dead jobs into the active queue. |
+| **3 Priority Tiers** | `high`, `normal`, and `low` queues processed in order using Redis multi-key `BRPOP`. |
+| **Weighted Slot Concurrency** | Dedicated slots for priority levels (e.g., 3 High, 2 Normal, 1 Low). |
+| **Horizontal Scaling** | Scale workers horizontally via `docker-compose up --scale worker=N`. |
+| **Job Leases (Crash Recovery)** | Active jobs are locked with `leasedUntil` and `leasedBy`. Atomic `acquireLease` prevents duplicate processing. |
+| **Background Lease Reaper** | Scans every 10s for `PROCESSING` jobs with expired leases and safely re-enqueues them. |
+| **Idempotency Keys** | Prevents duplicate job creation when clients retry network-dropped HTTP requests. |
+| **Search & Pagination API** | Query jobs by `status`, `type`, `priority` with pagination metadata. |
 
 ---
 
 ## Core Concepts
 
-### What is a Job?
+### Job Lifecycle State Machine
 
-A **job** is a unit of work with:
-- A **type** — tells the Worker what to do (`"example"`, `"fail-test"`)
-- A **payload** — the input data the Worker needs
-- A **status** — where the job is in its lifecycle
-- A **result** or **error** — the outcome after processing
+```
+              ┌──────────────┐
+              │    QUEUED    │ ◄──────────────────────────────┐
+              └──────┬───────┘                                │
+                     │ worker acquires lease                  │
+                     ▼                                        │
+              ┌──────────────┐                                │ retryCount < maxRetries
+              │  PROCESSING  │                                │ (re-enqueued with delay)
+              └──────┬───────┘                                │
+                     │                                        │
+        ┌────────────┴────────────┐                           │
+        │                         │                           │
+     Success                   Failure                        │
+        │                         │                           │
+        ▼                         ▼                           │
+ ┌─────────────┐       retryCount < maxRetries? ──────────────┘
+ │  COMPLETED  │                  │
+ └─────────────┘                  │ No (exhausted)
+                                  ▼
+                           ┌─────────────┐
+                           │    DEAD     │ ──(Requeue Endpoint)──► QUEUED
+                           └─────────────┘
+```
 
+---
+
+### Retries & Exponential Backoff
+
+When an unhandled exception occurs inside `jobProcessor.js`:
+- If `retryCount < maxRetries`, the job status returns to `QUEUED`, `retryCount` increments, and execution sleeps for `2^retryCount` seconds before re-pushing the ID into Redis:
+  - Attempt 1: wait 2s
+  - Attempt 2: wait 4s
+  - Attempt 3: wait 8s (up to max 30s)
+- If retries are exhausted, the job transitions to `DEAD`.
+
+---
+
+### Dead Letter Queue (DLQ) & Requeueing
+
+Instead of silently vanishing, exhausted jobs:
+1. Transition to `DEAD` in MongoDB with `deadAt` set to timestamp.
+2. Are pushed to Redis list `taskflow:dead`.
+3. Can be inspected via `GET /api/jobs/dead` or `GET /api/jobs?status=DEAD`.
+4. Can be requeued via `POST /api/jobs/:id/requeue`, which resets counters, removes the ID from `taskflow:dead`, and re-inserts it into the active priority queue.
+
+---
+
+### Priority Queues (Multi-key BRPOP)
+
+Instead of a single queue, TaskFlow maintains three separate Redis lists:
+- `taskflow:jobs:high`
+- `taskflow:jobs:normal`
+- `taskflow:jobs:low`
+
+Worker slots use Redis's native multi-key blocking pop:
+```javascript
+client.brpop("taskflow:jobs:high", "taskflow:jobs:normal", "taskflow:jobs:low", 0);
+```
+Redis checks keys strictly **left-to-right**. If `high` has items, it returns immediately and never touches `normal` or `low`. This gives strict priority ordering with zero polling overhead.
+
+---
+
+### Weighted Slot Concurrency & Worker Scaling
+
+Each Worker container runs an internal pool of independent execution **slots**. Slots are weighted so high-priority traffic always has dedicated processing power:
+
+- **HIGH Slots (3)**: Listen to `high -> normal -> low` (prioritize urgent work, help drain lower tiers if idle).
+- **NORMAL Slots (2)**: Listen to `normal -> low` (handle standard workload, never steal high-priority slots).
+- **LOW Slots (1)**: Listens to `low` (ensures background tasks never starve).
+
+To scale across multiple physical nodes or containers:
+```bash
+docker-compose up --scale worker=3 -d
+```
+All containers independently connect to Redis. Because Redis `BRPOP` is atomic, work is automatically distributed with zero race conditions.
+
+---
+
+### Job Leases & The Crash-Recovery Reaper
+
+**The Crash Problem:** If a worker picks up a job, marks it `PROCESSING`, and immediately encounters an Out-Of-Memory (OOM) or container crash, the job is lost from Redis and remains stuck in MongoDB forever.
+
+**The Solution:**
+1. **Atomic Lease:** When picking up a job, a slot runs an atomic MongoDB update:
+   ```javascript
+   Job.findOneAndUpdate(
+     { _id: jobId, status: "QUEUED" },
+     { $set: { status: "PROCESSING", leasedUntil: now + 30s, leasedBy: WORKER_ID } }
+   );
+   ```
+2. **Lease Reaper:** A background worker routine runs every 10 seconds checking:
+   ```javascript
+   Job.findOneAndUpdate(
+     { status: "PROCESSING", leasedUntil: { $lt: new Date() } },
+     { $set: { leasedUntil: now + 30s, leasedBy: WORKER_ID } }
+   );
+   ```
+   If found, the reaper increments `retryCount` and pushes the job back into Redis.
+
+---
+
+### Idempotency Keys
+
+Clients can provide an optional `idempotencyKey` on submission:
 ```json
 {
-  "_id": "abc123",
-  "type": "example",
-  "payload": { "message": "Hello TaskFlow" },
-  "status": "COMPLETED",
-  "result": { "message": "Job processed successfully" },
-  "createdAt": "2026-09-22T14:00:00Z",
-  "startedAt": "2026-09-22T14:00:00.3Z",
-  "completedAt": "2026-09-22T14:00:03.4Z"
+  "type": "send-invoice",
+  "payload": { "invoiceId": 1024 },
+  "idempotencyKey": "order_1024_attempt_1"
 }
 ```
+If the network drops and the client retries the request, the API detects the existing non-dead job and responds with `200 OK` and `{ duplicate: true, jobId: "..." }` without creating duplicate work.
 
 ---
 
-### What is a Queue?
-
-A queue is a line — **First In, First Out (FIFO)**. New jobs join at the back. The Worker picks from the front.
+## System Architecture Diagram
 
 ```
-New jobs →  [job5, job4, job3, job2, job1]  → Worker picks up
-                                     ↑
-                              processed first
-```
-
----
-
-### Why do we need a Worker?
-
-The **API** is designed to be fast. It receives requests and responds immediately. If the API also processed jobs, it would block and slow down for every user.
-
-The **Worker** is a separate process whose only job is to process work — slowly, thoroughly, without caring about HTTP response times.
-
-```
-API Process                     Worker Process
-────────────────────            ────────────────────
-Receives HTTP requests          Watches Redis queue
-Responds in milliseconds        Processes one job at a time
-Never blocks                    Can take seconds or minutes
-```
-
----
-
-### Why Redis?
-
-Redis is an **in-memory data store** — reads and writes happen in microseconds.
-
-For a queue, Redis provides the `BRPOP` command — a **blocking pop** that makes the Worker sleep with 0% CPU usage until a job arrives. No polling, no busy-waiting.
-
-```
-LPUSH taskflow:jobs <jobId>   ← API adds a job ID
-BRPOP taskflow:jobs 0         ← Worker waits (sleeps) until one appears
-```
-
-Redis is **temporary** — once the Worker picks up a job ID, it's gone from Redis.
-
----
-
-### Why MongoDB?
-
-MongoDB stores the **full persistent record** of every job — forever.
-
-- The API writes the full job document to MongoDB first
-- The Worker reads it, updates `status`, and writes back `result` or `error`
-- The Client reads from MongoDB via `GET /api/jobs/:id`
-
-MongoDB is **permanent** — job documents survive container restarts, worker crashes, and everything else.
-
----
-
-### MongoDB vs Redis — the key distinction
-
-> This is the most important concept in the project.
-
-| | MongoDB | Redis |
-|--|---------|-------|
-| **Stores** | Full job document (all fields) | Only the job ID |
-| **Purpose** | Permanent record — what happened | Temporary courier — what's waiting |
-| **When a Worker picks up a job** | Document stays forever | Job ID is removed |
-| **After job completes** | Document updated with result | Nothing (already empty) |
-| **Is it a queue?** | ❌ No | ✅ Yes |
-
-**MongoDB is not the queue. Redis is the queue.**
-
----
-
-## Architecture
-
-```
-                    Client
-                       │
-                       │ HTTP POST /api/jobs
-                       ▼
-              ┌─────────────────┐
-              │   API Server    │
-              │  Node/Express   │
-              └───────┬─────────┘
-                      │
-            ┌─────────┴──────────┐
-            │                    │
-            ▼                    ▼
-      ┌───────────┐       ┌────────────┐
-      │  MongoDB  │       │   Redis    │
-      │  (Atlas)  │       │   Queue    │
-      │           │       │            │
-      │ Full job  │       │  [jobId]   │
-      │ document  │       │            │
-      └───────────┘       └─────┬──────┘
-                                │
-                                │ BRPOP (blocking)
-                                ▼
-                        ┌───────────────┐
-                        │    Worker     │
-                        │  (separate    │
-                        │   process)    │
-                        └───────┬───────┘
-                                │
-                      Fetch job from MongoDB
-                      Update status → PROCESSING
-                      Process the job
-                      Update status → COMPLETED / FAILED
-                                │
-                                ▼
-                          ┌───────────┐
-                          │  MongoDB  │
-                          │  (Atlas)  │
-                          │  result   │
-                          └───────────┘
-                                │
-                                │ GET /api/jobs/:id
-                                ▼
-                            Client
-```
-
----
-
-## Job Lifecycle
-
-```
-                 POST /api/jobs
-                       │
-                       ▼
-                   ┌────────┐
-                   │ QUEUED │ ← Created in MongoDB, ID in Redis
-                   └───┬────┘
-                       │  Worker picks it up (BRPOP)
-                       ▼
-               ┌────────────┐
-               │ PROCESSING │ ← Worker set startedAt
-               └─────┬──────┘
-                     │
-           ┌─────────┴──────────┐
-           │                    │
-           ▼                    ▼
-     ┌───────────┐        ┌────────┐
-     │ COMPLETED │        │ FAILED │
-     │           │        │        │
-     │ result ✅ │        │ error ❌│
-     └───────────┘        └────────┘
-```
-
----
-
-## Project Structure
-
-```
-taskflow/
-│
-├── api/                          # Express API Server
-│   ├── src/
-│   │   ├── config/
-│   │   │   ├── db.js             # MongoDB connection
-│   │   │   └── redis.js          # Redis connection
-│   │   ├── controllers/
-│   │   │   └── jobController.js  # createJob, getJob logic
-│   │   ├── models/
-│   │   │   └── Job.js            # Mongoose schema
-│   │   ├── routes/
-│   │   │   └── jobRoutes.js      # URL → handler mapping
-│   │   ├── services/
-│   │   │   └── queueService.js   # enqueue / dequeue functions
-│   │   └── server.js             # Express entry point
-│   ├── Dockerfile
-│   └── package.json
-│
-├── worker/                       # Job Worker Process
-│   ├── src/
-│   │   ├── config/
-│   │   │   ├── db.js             # MongoDB connection (separate)
-│   │   │   └── redis.js          # Redis connection factory
-│   │   ├── jobs/
-│   │   │   └── jobProcessor.js   # Job type handlers
-│   │   └── worker.js             # Main worker loop
-│   ├── Dockerfile
-│   └── package.json
-│
-├── docker-compose.yml            # Orchestrates all services
-├── .env                          # Your environment variables (not in Git)
-├── .env.example                  # Template for .env
-├── .gitignore
-└── README.md
+                             HTTP Clients / Frontends
+                                        │
+                                        ▼
+                                ┌───────────────┐
+                                │ TaskFlow API  │ :3001
+                                └───────┬───────┘
+                                        │
+             ┌──────────────────────────┴──────────────────────────┐
+             ▼                                                     ▼
+     ┌───────────────┐                                     ┌───────────────┐
+     │ MongoDB Atlas │ ◄────────────────┐                  │  Redis Server │ :6380
+     └───────────────┘                  │                  └───────┬───────┘
+             ▲                          │                          │
+             │ Status, Payload,         │ Lease Updates,           │ Atomic BRPOP
+             │ Results, DLQ             │ Reaper Rescues           │ Lists (high/norm/low/dead)
+             │                          │                          │
+   ┌─────────┴──────────────────────────┴──────────────────────────┴─────────┐
+   │                                                                         │
+   │  ┌───────────────────────────────┐     ┌───────────────────────────────┐│
+   │  │       Worker Container 1      │     │       Worker Container 2      ││
+   │  │  [Slot 1-3] HIGH (3 slots)    │     │  [Slot 1-3] HIGH (3 slots)    ││
+   │  │  [Slot 4-5] NORMAL (2 slots)  │     │  [Slot 4-5] NORMAL (2 slots)  ││
+   │  │  [Slot 6]   LOW (1 slot)      │     │  [Slot 6]   LOW (1 slot)      ││
+   │  │  [REAPER]   Every 10s         │     │  [REAPER]   Every 10s         ││
+   │  └───────────────────────────────┘     └───────────────────────────────┘│
+   │                           Distributed Workers                           │
+   └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology | Why |
-|-------|-----------|-----|
-| API Server | Node.js + Express | Fast, familiar, minimal |
-| Database | MongoDB + Mongoose | Flexible schema, Atlas cloud hosting |
-| Queue | Redis (ioredis) | In-memory speed, native `BRPOP` blocking |
-| Infrastructure | Docker + Docker Compose | One command to start everything |
-| Language | JavaScript | Consistent across API and Worker |
-
-**Not used (Phase 1):** PostgreSQL, BullMQ, Kafka, RabbitMQ, Kubernetes, cloud services.
+- **Runtime:** Node.js (v20 Alpine)
+- **API Framework:** Express.js
+- **Primary Database:** MongoDB Atlas (Cloud Mongoose ODM)
+- **In-Memory Queue Engine:** Redis 7 (Alpine)
+- **Redis Client:** `ioredis`
+- **Orchestration:** Docker Compose (Bridge Network)
 
 ---
 
-## API Documentation
+## Project Structure
 
-### POST `/api/jobs`
-Submit a new job.
-
-**Request:**
-```json
-{
-  "type": "example",
-  "payload": {
-    "message": "Hello TaskFlow"
-  }
-}
 ```
-
-**Response `201`:**
-```json
-{
-  "jobId": "6ab29d91951c0a1bcf08e355",
-  "status": "QUEUED"
-}
+taskflow/backend/
+├── docker-compose.yml         # Multi-service setup (Redis, API, scalable Worker)
+├── .env                       # Environment credentials (MONGODB_URI)
+├── .env.example               # Example template
+├── README.md                  # Comprehensive Documentation
+├── api/
+│   ├── Dockerfile
+│   ├── package.json
+│   └── src/
+│       ├── server.js          # Express app entry point
+│       ├── config/
+│       │   ├── db.js          # Mongoose connection
+│       │   └── redis.js       # Shared API Redis instance
+│       ├── models/
+│       │   └── Job.js         # Mongoose schema (leases, idempotency, indexes)
+│       ├── controllers/
+│       │   └── jobController.js # Endpoints (CRUD, DLQ, requeue, list/filter)
+│       ├── routes/
+│       │   └── jobRoutes.js   # Route definitions
+│       └── services/
+│           └── queueService.js# Redis queue operations (LPUSH, BRPOP, DLQ)
+└── worker/
+    ├── Dockerfile
+    ├── package.json
+    └── src/
+        ├── worker.js          # Main worker loop (weighted slots, reaper, leases)
+        ├── config/
+        │   ├── db.js          # Dedicated worker Mongo connection
+        │   └── redis.js       # Factory for dedicated BRPOP clients
+        └── jobs/
+            └── jobProcessor.js# Task handlers by type
 ```
-
-**Job Types:**
-| type | behaviour |
-|------|-----------|
-| `"example"` | Waits 3 seconds, returns success result |
-| `"fail-test"` | Intentionally fails → FAILED status |
 
 ---
 
-### GET `/api/jobs/:id`
-Get the current status of a job.
+## API Reference
 
-**Response — QUEUED:**
+### 1. Create a Job
+`POST /api/jobs`
+
+**Request Body:**
 ```json
 {
-  "jobId": "...",
   "type": "example",
+  "payload": { "userId": 42 },
+  "priority": "high",
+  "maxRetries": 3,
+  "idempotencyKey": "unique-client-tx-999"
+}
+```
+
+**Response (201 Created):**
+```json
+{
+  "jobId": "6ab52e2a6cb729c3577da559",
   "status": "QUEUED",
-  "createdAt": "2026-09-22T14:00:00.000Z"
+  "priority": "high",
+  "maxRetries": 3,
+  "idempotencyKey": "unique-client-tx-999",
+  "duplicate": false
+}
+```
+*(If called again with the same `idempotencyKey`, returns `200 OK` with `"duplicate": true`)*
+
+---
+
+### 2. List & Filter Jobs
+`GET /api/jobs`
+
+**Query Parameters (all optional):**
+- `status`: `QUEUED`, `PROCESSING`, `COMPLETED`, `FAILED`, `DEAD`
+- `type`: e.g. `example`, `fail-test`
+- `priority`: `high`, `normal`, `low`
+- `page`: Page number (default: `1`)
+- `limit`: Items per page (default: `20`, max: `100`)
+
+**Response (200 OK):**
+```json
+{
+  "meta": {
+    "total": 42,
+    "page": 1,
+    "limit": 20,
+    "totalPages": 3,
+    "hasNextPage": true,
+    "hasPrevPage": false,
+    "filter": { "priority": "high" }
+  },
+  "jobs": [
+    {
+      "jobId": "6ab52e2a6cb729c3577da559",
+      "type": "example",
+      "priority": "high",
+      "status": "COMPLETED",
+      "retryCount": 0,
+      "maxRetries": 3,
+      "createdAt": "2026-09-24T14:05:30.510Z",
+      "startedAt": "2026-09-24T14:05:30.689Z",
+      "completedAt": "2026-09-24T14:05:33.785Z"
+    }
+  ]
 }
 ```
 
-**Response — PROCESSING:**
-```json
-{
-  "jobId": "...",
-  "type": "example",
-  "status": "PROCESSING",
-  "createdAt": "2026-09-22T14:00:00.000Z",
-  "startedAt": "2026-09-22T14:00:00.200Z"
-}
-```
+---
 
-**Response — COMPLETED:**
+### 3. Get Single Job Status
+`GET /api/jobs/:id`
+
+**Response (200 OK):**
 ```json
 {
-  "jobId": "...",
+  "jobId": "6ab52e2a6cb729c3577da559",
   "type": "example",
+  "priority": "high",
   "status": "COMPLETED",
-  "createdAt": "2026-09-22T14:00:00.000Z",
-  "startedAt": "2026-09-22T14:00:00.200Z",
-  "completedAt": "2026-09-22T14:00:03.400Z",
-  "result": {
-    "message": "Job processed successfully",
-    "processedAt": "2026-09-22T14:00:03.400Z"
-  }
+  "retryCount": 0,
+  "maxRetries": 3,
+  "createdAt": "2026-09-24T14:05:30.510Z",
+  "startedAt": "2026-09-24T14:05:30.689Z",
+  "completedAt": "2026-09-24T14:05:33.785Z",
+  "result": { "message": "Job processed successfully", "duration": "3000ms" }
 }
 ```
 
-**Response — FAILED:**
+---
+
+### 4. List Dead Letter Queue (DLQ)
+`GET /api/jobs/dead`
+
+**Response (200 OK):**
 ```json
 {
-  "jobId": "...",
-  "type": "fail-test",
-  "status": "FAILED",
-  "createdAt": "2026-09-22T14:00:00.000Z",
-  "startedAt": "2026-09-22T14:00:00.200Z",
-  "completedAt": "2026-09-22T14:00:01.800Z",
-  "error": "Intentional failure: fail-test job type always fails"
+  "count": 1,
+  "jobs": [
+    {
+      "jobId": "6ab3eb7b24653b81325af1ba",
+      "type": "fail-test",
+      "priority": "normal",
+      "status": "DEAD",
+      "error": "Intentional failure: fail-test job type always fails",
+      "retryCount": 1,
+      "maxRetries": 1,
+      "deadAt": "2026-09-23T15:17:02.872Z",
+      "createdAt": "2026-09-23T15:08:43.836Z"
+    }
+  ]
 }
 ```
 
-**Error responses:**
-| Status | Meaning |
-|--------|---------|
-| `400` | Invalid job ID format |
-| `404` | Job not found |
-| `500` | Server error |
+---
+
+### 5. Requeue Dead Job
+`POST /api/jobs/:id/requeue`
+
+**Response (200 OK):**
+```json
+{
+  "jobId": "6ab3eb7b24653b81325af1ba",
+  "status": "QUEUED",
+  "priority": "normal",
+  "message": "Job has been requeued successfully. It will be processed shortly."
+}
+```
+
+---
+
+## Configuration & Environment Variables
+
+### Docker Compose Environment (`docker-compose.yml`):
+```yaml
+environment:
+  - MONGODB_URI=${MONGODB_URI}
+  - REDIS_URL=redis://redis:6379
+  - WORKER_SLOTS_HIGH=3      # High-priority slots per worker container
+  - WORKER_SLOTS_NORMAL=2    # Normal-priority slots per worker container
+  - WORKER_SLOTS_LOW=1       # Low-priority slots per worker container
+  - LEASE_DURATION_MS=30000  # Lease expiration window (30s)
+  - REAPER_INTERVAL_MS=10000 # Orphan scan interval (10s)
+```
 
 ---
 
 ## How to Run
 
-### Prerequisites
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
-- A `.env` file in the project root (copy from `.env.example`)
+### 1. Prerequisites
+- Docker Desktop installed and running
+- A MongoDB Atlas connection string in `backend/.env`:
+  ```ini
+  MONGODB_URI=mongodb+srv://<user>:<password>@cluster0.xxx.mongodb.net/taskflow
+  ```
 
-### 1. Set up environment
-```bash
-cp .env.example .env
-# Edit .env and set your MONGODB_URI (Atlas or local)
+### 2. Start Services
+```powershell
+cd C:\Users\akasi\OneDrive\Desktop\taskflow\backend
+
+# Start 1 API + 1 Redis + 2 Worker containers
+docker-compose up --build --scale worker=2 -d
 ```
 
-### 2. Start everything
-```bash
-docker-compose up --build -d
-```
-
-### 3. Verify
-```bash
-# Check all containers are running
+### 3. Check Service Status
+```powershell
 docker-compose ps
-
-# Check API is connected to MongoDB and Redis
-docker-compose logs api
-
-# Check Worker is waiting for jobs
-docker-compose logs worker
 ```
 
-### 4. Test the health endpoint
-```
-GET http://localhost:3001/health
-```
-
-### Stop everything
-```bash
-docker-compose down
-```
-
----
-
-## How to Test
-
-### Submit a job
-```bash
-curl -X POST http://localhost:3001/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"type": "example", "payload": {"message": "Hello"}}'
-```
-
-### Check job status (replace with your jobId)
-```bash
-curl http://localhost:3001/api/jobs/<jobId>
-```
-
-### Watch the Worker process jobs live
-```bash
+### 4. View Worker Activity
+```powershell
 docker-compose logs -f worker
 ```
 
-### Trigger a failure
-```bash
-curl -X POST http://localhost:3001/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"type": "fail-test", "payload": {}}'
-```
-
-### Inspect the Redis queue
-```bash
-# See job IDs waiting in the queue
-docker exec taskflow-redis redis-cli LRANGE taskflow:jobs 0 -1
-
-# Count jobs in queue
-docker exec taskflow-redis redis-cli LLEN taskflow:jobs
-```
-
 ---
 
-## Example Logs
+## Testing & Verification Flows
 
-### API (when a job is submitted):
+### Test 1: Priority Queueing
+Submit a `low` priority job followed immediately by a `high` priority job:
+```powershell
+Invoke-RestMethod -Method POST -Uri http://localhost:3001/api/jobs -ContentType "application/json" -Body '{"type":"example","priority":"low"}'
+Invoke-RestMethod -Method POST -Uri http://localhost:3001/api/jobs -ContentType "application/json" -Body '{"type":"example","priority":"high"}'
 ```
-[API] MongoDB connected → mongodb+srv://...
-[API] Redis connected   → redis://redis:6379
-[API] TaskFlow API server running on port 3000
-[API] Job created: 6ab29d91951c0a1bcf08e355
-[API] Job enqueued in Redis: 6ab29d91951c0a1bcf08e355
-[API] Job queued:  6ab29d91951c0a1bcf08e355
+*Observe logs: HIGH slots pick up the `high` job immediately.*
+
+### Test 2: Retries and DLQ
+Submit a job configured to intentionally fail:
+```powershell
+Invoke-RestMethod -Method POST -Uri http://localhost:3001/api/jobs -ContentType "application/json" -Body '{"type":"fail-test","maxRetries":2}'
 ```
+*Observe logs: Worker retries at 2s, 4s, and then marks the job `DEAD` in `taskflow:dead`.*
 
-### Worker (processing a job):
+### Test 3: Idempotency
+Send identical POSTs with the same `idempotencyKey`:
+```powershell
+$body = '{"type":"example","idempotencyKey":"tx_test_1"}'
+Invoke-RestMethod -Method POST -Uri http://localhost:3001/api/jobs -ContentType "application/json" -Body $body
+Invoke-RestMethod -Method POST -Uri http://localhost:3001/api/jobs -ContentType "application/json" -Body $body
 ```
-[WORKER] TaskFlow Worker starting...
-[WORKER] MongoDB connected → mongodb+srv://...
-[WORKER] Redis connected   → redis://redis:6379
-[WORKER] Waiting for jobs...
-
-[WORKER] ──────────────────────────────────────
-[WORKER] Received job: 6ab29d91951c0a1bcf08e355
-[WORKER] Job status: PROCESSING
-[WORKER] Processing job: 6ab29d91951c0a1bcf08e355
-[WORKER] Payload: {"message":"Hello"}
-[WORKER] Job completed: 6ab29d91951c0a1bcf08e355
-[WORKER] Result: {"message":"Job processed successfully",...}
-[WORKER] ──────────────────────────────────────
-
-[WORKER] Waiting for jobs...
-```
-
-### Worker (failed job):
-```
-[WORKER] ──────────────────────────────────────
-[WORKER] Received job: 6ab29d95951c0a1bcf08e358
-[WORKER] Job status: PROCESSING
-[WORKER] Running fail-test job: 6ab29d95951c0a1bcf08e358
-[WORKER] Job FAILED: 6ab29d95951c0a1bcf08e358
-[WORKER] Error: Intentional failure: fail-test job type always fails
-[WORKER] ──────────────────────────────────────
-```
-
----
-
-## Git Commit Guide
-
-Suggested commit structure (make these after verifying each step):
-
-```
-git init
-git add .
-git commit -m "Initialize TaskFlow project structure"
-
-git add api/src/models/ api/src/config/db.js
-git commit -m "Add MongoDB connection and Job model"
-
-git add api/src/controllers/ api/src/routes/ api/src/server.js
-git commit -m "Add POST /api/jobs endpoint (MongoDB only)"
-
-git add api/src/config/redis.js api/src/services/queueService.js
-git commit -m "Add Redis connection and queue service"
-
-git add api/src/controllers/jobController.js
-git commit -m "Enqueue job ID into Redis after MongoDB save"
-
-git add worker/
-git commit -m "Add Worker: BRPOP loop, job processor, FAILED handling"
-
-git add api/src/controllers/jobController.js
-git commit -m "Polish GET /api/jobs/:id with clean status-aware responses"
-
-git add README.md
-git commit -m "Add README with architecture, concepts, and API docs"
-```
-
----
-
-## Phase 2 (Future)
-
-Not implemented yet — keeping Phase 1 simple:
-
-- Job retries + exponential backoff
-- Dead Letter Queue (permanently failed jobs)
-- Job priorities
-- Multiple queues
-- Worker heartbeat + failure recovery
-- Scheduled / cron jobs
-- WebSocket live status updates
-- Prometheus + Grafana metrics
-- Authentication
+*Observe response: Second call returns the same `jobId` with `"duplicate": true`.*
