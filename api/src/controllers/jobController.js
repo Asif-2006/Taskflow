@@ -1,12 +1,9 @@
 /**
  * jobController.js - Business Logic for Job Endpoints
  *
- * Phase 2 additions:
- *   createJob  - accepts priority ("high"/"normal"/"low") and maxRetries
- *   getJob     - returns priority, retryCount, lastError, deadAt
- *   listDead   - GET /api/jobs/dead
- *   requeueJob - POST /api/jobs/:id/requeue
- *   listJobs   - GET /api/jobs?status=X&type=Y&priority=Z&page=1&limit=20
+ * Phase 3 additions:
+ *   createJob - idempotency key support (prevents duplicate jobs on retried POSTs)
+ *   getJob    - now returns leasedUntil, leasedBy, idempotencyKey
  */
 
 const Job = require("../models/Job");
@@ -16,7 +13,7 @@ const { enqueue, getDead, removeFromDead } = require("../services/queueService")
 
 const createJob = async (req, res) => {
   try {
-    const { type, payload, priority, maxRetries } = req.body;
+    const { type, payload, priority, maxRetries, idempotencyKey } = req.body;
 
     if (!type) {
       return res.status(400).json({ error: "Missing required field: type" });
@@ -32,70 +29,90 @@ const createJob = async (req, res) => {
       }
     }
 
+    // ── Idempotency check ─────────────────────────────────────────────────────
+    // If the client provided a key, check if a job with that key already exists.
+    // This handles the case where the client retries a POST after a timeout.
+    //
+    // We only treat active jobs as duplicates. A DEAD job with the same key
+    // is treated as a new job — the original died, so starting fresh is correct.
+    if (idempotencyKey) {
+      const existing = await Job.findOne({ idempotencyKey });
+
+      if (existing && existing.status !== "DEAD") {
+        console.log(`[API] Duplicate request blocked — idempotencyKey: ${idempotencyKey} -> existing job: ${existing._id}`);
+        return res.status(200).json({
+          jobId:          existing._id,
+          status:         existing.status,
+          priority:       existing.priority,
+          maxRetries:     existing.maxRetries,
+          idempotencyKey: existing.idempotencyKey,
+          duplicate:      true, // tells the client this is the original, not a new job
+        });
+      }
+    }
+
     const job = new Job({
       type,
-      payload: payload || {},
-      ...(priority   !== undefined && { priority }),
-      ...(maxRetries !== undefined && { maxRetries }),
+      payload:    payload || {},
+      ...(priority        !== undefined && { priority }),
+      ...(maxRetries      !== undefined && { maxRetries }),
+      ...(idempotencyKey  !== undefined && { idempotencyKey }),
     });
 
     await job.save();
     await enqueue(job._id, job.priority);
 
-    console.log(`[API] Job created: ${job._id} (type: ${job.type}, priority: ${job.priority}, maxRetries: ${job.maxRetries})`);
+    console.log(`[API] Job created: ${job._id} (type: ${job.type}, priority: ${job.priority}, maxRetries: ${job.maxRetries}${idempotencyKey ? ", idempotencyKey: " + idempotencyKey : ""})`);
 
     return res.status(201).json({
-      jobId:      job._id,
-      status:     job.status,
-      priority:   job.priority,
-      maxRetries: job.maxRetries,
+      jobId:          job._id,
+      status:         job.status,
+      priority:       job.priority,
+      maxRetries:     job.maxRetries,
+      idempotencyKey: job.idempotencyKey || undefined,
+      duplicate:      false,
     });
   } catch (error) {
+    // MongoDB duplicate key error on idempotencyKey (race condition safety net)
+    if (error.code === 11000) {
+      const existing = await Job.findOne({ idempotencyKey: req.body.idempotencyKey });
+      if (existing) {
+        return res.status(200).json({
+          jobId:          existing._id,
+          status:         existing.status,
+          priority:       existing.priority,
+          maxRetries:     existing.maxRetries,
+          idempotencyKey: existing.idempotencyKey,
+          duplicate:      true,
+        });
+      }
+    }
     console.error("[API] Error creating job:", error.message);
     return res.status(500).json({ error: "Failed to create job" });
   }
 };
 
 // ─── GET /api/jobs ────────────────────────────────────────────────────────────
-// List and filter jobs with pagination.
-//
-// Query params (all optional):
-//   status   -> QUEUED | PROCESSING | COMPLETED | FAILED | DEAD
-//   type     -> any string (e.g. "example", "fail-test")
-//   priority -> high | normal | low
-//   page     -> default 1
-//   limit    -> default 20, max 100
-//
-// Examples:
-//   GET /api/jobs                        -> all jobs page 1
-//   GET /api/jobs?status=DEAD            -> only dead jobs
-//   GET /api/jobs?priority=high&page=2   -> high priority page 2
-//   GET /api/jobs?type=example&limit=5   -> example type, 5 per page
-// ─────────────────────────────────────────────────────────────────────────────
 
 const listJobs = async (req, res) => {
   try {
     const { status, type, priority } = req.query;
-
-    // Pagination — clamp to sane values
     const page  = Math.max(1, parseInt(req.query.page,  10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
     const skip  = (page - 1) * limit;
 
-    // Build MongoDB filter dynamically — only add fields the client provided
     const filter = {};
     if (status)   filter.status   = status;
     if (type)     filter.type     = type;
     if (priority) filter.priority = priority;
 
-    // Count + data in parallel (faster than sequential)
     const [total, jobs] = await Promise.all([
       Job.countDocuments(filter),
       Job.find(filter)
-        .sort({ createdAt: -1 }) // newest first
+        .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .select("_id type priority status retryCount maxRetries createdAt startedAt completedAt deadAt"),
+        .select("_id type priority status retryCount maxRetries idempotencyKey createdAt startedAt completedAt deadAt leasedUntil leasedBy"),
     ]);
 
     const totalPages = Math.ceil(total / limit);
@@ -113,19 +130,21 @@ const listJobs = async (req, res) => {
         ),
       },
       jobs: jobs.map((job) => ({
-        jobId:      job._id,
-        type:       job.type,
-        priority:   job.priority,
-        status:     job.status,
-        retryCount: job.retryCount,
-        maxRetries: job.maxRetries,
-        createdAt:  job.createdAt,
+        jobId:          job._id,
+        type:           job.type,
+        priority:       job.priority,
+        status:         job.status,
+        retryCount:     job.retryCount,
+        maxRetries:     job.maxRetries,
+        idempotencyKey: job.idempotencyKey || undefined,
+        createdAt:      job.createdAt,
         ...(job.startedAt   && { startedAt:   job.startedAt }),
         ...(job.completedAt && { completedAt: job.completedAt }),
         ...(job.deadAt      && { deadAt:      job.deadAt }),
+        ...(job.leasedUntil && { leasedUntil: job.leasedUntil }),
+        ...(job.leasedBy    && { leasedBy:    job.leasedBy }),
       })),
     });
-
   } catch (error) {
     console.error("[API] Error listing jobs:", error.message);
     return res.status(500).json({ error: "Failed to list jobs" });
@@ -138,21 +157,22 @@ const listDead = async (req, res) => {
   try {
     const deadJobs = await Job.find({ status: "DEAD" })
       .sort({ deadAt: -1 })
-      .select("_id type payload priority status error retryCount maxRetries deadAt createdAt");
+      .select("_id type payload priority status error retryCount maxRetries idempotencyKey deadAt createdAt");
 
     return res.json({
       count: deadJobs.length,
       jobs: deadJobs.map((job) => ({
-        jobId:      job._id,
-        type:       job.type,
-        payload:    job.payload,
-        priority:   job.priority,
-        status:     job.status,
-        error:      job.error,
-        retryCount: job.retryCount,
-        maxRetries: job.maxRetries,
-        deadAt:     job.deadAt,
-        createdAt:  job.createdAt,
+        jobId:          job._id,
+        type:           job.type,
+        payload:        job.payload,
+        priority:       job.priority,
+        status:         job.status,
+        error:          job.error,
+        retryCount:     job.retryCount,
+        maxRetries:     job.maxRetries,
+        idempotencyKey: job.idempotencyKey || undefined,
+        deadAt:         job.deadAt,
+        createdAt:      job.createdAt,
       })),
     });
   } catch (error) {
@@ -188,6 +208,8 @@ const requeueJob = async (req, res) => {
     job.deadAt      = null;
     job.startedAt   = null;
     job.completedAt = null;
+    job.leasedUntil = null;
+    job.leasedBy    = null;
     await job.save();
 
     await removeFromDead(id);
@@ -230,9 +252,13 @@ const getJob = async (req, res) => {
       createdAt:  job.createdAt,
     };
 
-    if (job.startedAt)   response.startedAt   = job.startedAt;
-    if (job.completedAt) response.completedAt = job.completedAt;
-    if (job.deadAt)      response.deadAt      = job.deadAt;
+    if (job.idempotencyKey) response.idempotencyKey = job.idempotencyKey;
+    if (job.startedAt)      response.startedAt      = job.startedAt;
+    if (job.completedAt)    response.completedAt    = job.completedAt;
+    if (job.deadAt)         response.deadAt         = job.deadAt;
+    if (job.leasedUntil)    response.leasedUntil    = job.leasedUntil;
+    if (job.leasedBy)       response.leasedBy       = job.leasedBy;
+
     if (job.status === "COMPLETED") response.result    = job.result;
     if (job.status === "FAILED" || job.status === "DEAD") response.error = job.error;
     if (job.lastError)  response.lastError = job.lastError;

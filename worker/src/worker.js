@@ -1,50 +1,61 @@
 /**
- * worker.js - The Worker Process (Phase 2: Retries + DLQ + Priorities + Weighted Concurrency)
+ * worker.js - The Worker Process
+ * Phase 3: Job Leases + Lease Reaper (crash recovery)
  *
- * DISTRIBUTED DESIGN:
- *   Run multiple independent worker CONTAINERS using:
- *     docker-compose up --scale worker=3
+ * LEASE LIFECYCLE:
  *
- *   Each container:
- *     - Is a completely separate Node.js process (separate machine in prod)
- *     - Has its own slot pool (3 HIGH + 2 NORMAL + 1 LOW = 6 slots)
- *     - Has its own Redis connections (6 BRPOP connections per container)
- *     - Shares the same Redis queues and MongoDB as all other workers
+ *   1. Worker picks up jobId from Redis via BRPOP
+ *   2. Worker calls acquireLease(jobId) in MongoDB:
+ *        - Uses findOneAndUpdate with conditions to prevent double-processing:
+ *          { _id: jobId, status: { $in: ["QUEUED"] } }
+ *        - Sets: status=PROCESSING, leasedUntil=now+30s, leasedBy=WORKER_ID
+ *        - If another worker already grabbed it (race): returns null -> skip
+ *   3. Worker processes the job
+ *   4. Worker calls releaseLease(job) on success or failure:
+ *        - Clears leasedUntil and leasedBy
+ *        - Sets final status (COMPLETED / DEAD)
  *
- *   Redis BRPOP is atomic — only ONE worker across ALL containers can
- *   receive any given job. No duplicates. No race conditions.
+ * LEASE REAPER:
  *
- *   With 3 worker containers: 18 parallel job processors total
- *   If one container crashes: the other two continue unaffected
+ *   A background loop runs every REAPER_INTERVAL seconds in EACH worker.
+ *   It finds jobs where:
+ *     { status: "PROCESSING", leasedUntil: { $lt: now } }
+ *   These are orphaned jobs — their worker crashed before finishing.
  *
- * WEIGHTED SLOT POOL (per container):
- *   HIGH slots   (3): BRPOP high -> normal -> low
- *   NORMAL slots (2): BRPOP normal -> low
- *   LOW slots    (1): BRPOP low
+ *   The reaper atomically claims one orphaned job at a time using
+ *   findOneAndUpdate, ensuring only ONE reaper across all distributed
+ *   workers rescues each orphaned job. No duplicates.
  *
- * WORKER IDENTITY:
- *   Each container gets a unique Docker hostname (e.g. "a3f2c1b4").
- *   All log lines are prefixed with [workerID] so you can trace
- *   which physical worker handled which job across distributed instances.
+ *   Orphaned job handling:
+ *     retryCount < maxRetries -> increment retryCount, QUEUED, re-enqueue
+ *     retryCount >= maxRetries -> DEAD, push to DLQ
  *
- * Controlled via env vars in docker-compose.yml:
+ * DISTRIBUTED SAFETY:
+ *   acquireLease uses atomic findOneAndUpdate — if two workers race to
+ *   claim the same job after a reaper re-enqueues it, only one wins.
+ *   The loser gets null back and skips. No double-processing.
+ *
+ * Env vars:
  *   WORKER_SLOTS_HIGH=3
  *   WORKER_SLOTS_NORMAL=2
  *   WORKER_SLOTS_LOW=1
+ *   LEASE_DURATION_MS=30000   (30s lease window)
+ *   REAPER_INTERVAL_MS=10000  (check for orphans every 10s)
  */
 
 require("dotenv").config();
 
-const os      = require("os");
+const os        = require("os");
 const connectDB = require("./config/db");
 const { createRedisClient } = require("./config/redis");
 const { processJob } = require("./jobs/jobProcessor");
-const mongoose = require("mongoose");
+const mongoose  = require("mongoose");
 
-// Unique identity for this worker instance.
-// Docker assigns each container a unique hostname (short UUID).
-// Shows up in every log line so you know WHICH machine processed the job.
 const WORKER_ID = os.hostname().slice(0, 8);
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+const LEASE_DURATION_MS  = parseInt(process.env.LEASE_DURATION_MS,  10) || 30000;
+const REAPER_INTERVAL_MS = parseInt(process.env.REAPER_INTERVAL_MS, 10) || 10000;
 
 // ─── Job Model ────────────────────────────────────────────────────────────────
 const jobSchema = new mongoose.Schema(
@@ -57,18 +68,22 @@ const jobSchema = new mongoose.Schema(
       enum:    ["QUEUED", "PROCESSING", "COMPLETED", "FAILED", "DEAD"],
       default: "QUEUED",
     },
-    result:     { type: mongoose.Schema.Types.Mixed, default: null },
-    error:      { type: String, default: null },
-    retryCount: { type: Number, default: 0 },
-    maxRetries: { type: Number, default: 3 },
-    lastError:  { type: String, default: null },
-    startedAt:   { type: Date, default: null },
-    completedAt: { type: Date, default: null },
-    deadAt:      { type: Date, default: null },
+    result:         { type: mongoose.Schema.Types.Mixed, default: null },
+    error:          { type: String, default: null },
+    retryCount:     { type: Number, default: 0 },
+    maxRetries:     { type: Number, default: 3 },
+    lastError:      { type: String, default: null },
+    leasedUntil:    { type: Date,   default: null },
+    leasedBy:       { type: String, default: null },
+    idempotencyKey: { type: String, default: null },
+    startedAt:      { type: Date,   default: null },
+    completedAt:    { type: Date,   default: null },
+    deadAt:         { type: Date,   default: null },
   },
   { timestamps: true }
 );
 
+jobSchema.index({ status: 1, leasedUntil: 1 }); // Reaper query
 const Job = mongoose.model("Job", jobSchema);
 
 // ─── Queue names ──────────────────────────────────────────────────────────────
@@ -79,7 +94,7 @@ const QUEUES = {
 };
 const DLQ_NAME = "taskflow:dead";
 
-// ─── Slot type definitions ────────────────────────────────────────────────────
+// ─── Slot types ───────────────────────────────────────────────────────────────
 const SLOT_TYPES = {
   high:   { label: "HIGH",   queues: [QUEUES.high, QUEUES.normal, QUEUES.low] },
   normal: { label: "NORMAL", queues: [QUEUES.normal, QUEUES.low] },
@@ -90,37 +105,158 @@ const SLOT_TYPES = {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const getBackoffDelay = (retryCount) => Math.min(Math.pow(2, retryCount) * 1000, 30000);
 
-// ─── Single Slot ──────────────────────────────────────────────────────────────
-const runSlot = async (slotId, slotType) => {
+// ─── Lease Helpers ────────────────────────────────────────────────────────────
+
+/**
+ * acquireLease(jobId, tag)
+ *
+ * Atomically claims a job for processing.
+ * Uses findOneAndUpdate with strict conditions — safe even if multiple
+ * workers try to claim the same job simultaneously (only one wins).
+ *
+ * Returns the updated job document, or null if the job was already taken.
+ */
+const acquireLease = async (jobId, tag) => {
+  const leasedUntil = new Date(Date.now() + LEASE_DURATION_MS);
+
+  const job = await Job.findOneAndUpdate(
+    {
+      _id:    jobId,
+      // Only claim if still QUEUED — prevents double-processing after
+      // a reaper re-enqueues and two workers race to pick it up
+      status: "QUEUED",
+    },
+    {
+      $set: {
+        status:      "PROCESSING",
+        startedAt:   new Date(),
+        leasedUntil,
+        leasedBy:    WORKER_ID,
+      },
+    },
+    { new: true } // return the updated document
+  );
+
+  if (!job) {
+    console.warn(`${tag} Could not acquire lease for ${jobId} — already taken or not QUEUED. Skipping.`);
+    return null;
+  }
+
+  console.log(`${tag} Lease acquired: expires in ${LEASE_DURATION_MS / 1000}s (${leasedUntil.toISOString()})`);
+  return job;
+};
+
+/**
+ * releaseLease(job)
+ * Clears the lease fields after a job completes (success or failure).
+ */
+const releaseLease = async (jobId) => {
+  await Job.updateOne(
+    { _id: jobId },
+    { $set: { leasedUntil: null, leasedBy: null } }
+  );
+};
+
+// ─── Lease Reaper ─────────────────────────────────────────────────────────────
+
+/**
+ * runReaper(redisClient)
+ *
+ * Background loop that rescues orphaned jobs (worker crashed mid-processing).
+ * Runs every REAPER_INTERVAL_MS in each worker instance.
+ *
+ * Safety: uses findOneAndUpdate to atomically "claim" each orphaned job,
+ * so only ONE reaper across all distributed workers handles each one.
+ */
+const runReaper = async (redisClient) => {
+  const tag = `[${WORKER_ID}][REAPER]`;
+  console.log(`${tag} Started — scanning every ${REAPER_INTERVAL_MS / 1000}s for orphaned jobs`);
+
+  while (true) {
+    await sleep(REAPER_INTERVAL_MS);
+
+    try {
+      // Atomically find AND update one orphaned job at a time.
+      // "Orphaned" = PROCESSING with an expired lease.
+      // We extend the lease while we handle it to prevent other reapers
+      // from also picking it up during our processing window.
+      const orphan = await Job.findOneAndUpdate(
+        {
+          status:      "PROCESSING",
+          leasedUntil: { $lt: new Date() }, // lease has expired
+        },
+        {
+          $set: {
+            // Extend lease so no other reaper grabs this one while we handle it
+            leasedUntil: new Date(Date.now() + LEASE_DURATION_MS),
+            leasedBy:    WORKER_ID,
+          },
+        },
+        { new: true }
+      );
+
+      if (!orphan) continue; // nothing to rescue — loop back
+
+      console.log(`\n${tag} ⚠️  ORPHANED JOB FOUND: ${orphan._id}`);
+      console.log(`${tag} Was held by: ${orphan.leasedBy || "unknown"} (lease expired)`);
+      console.log(`${tag} retryCount: ${orphan.retryCount}/${orphan.maxRetries}`);
+
+      if (orphan.retryCount < orphan.maxRetries) {
+        // Rescue: treat it like a retry
+        orphan.retryCount += 1;
+        orphan.status      = "QUEUED";
+        orphan.lastError   = "Worker crashed or timed out (lease expired)";
+        orphan.leasedUntil = null;
+        orphan.leasedBy    = null;
+        await orphan.save();
+
+        const queueName = QUEUES[orphan.priority] || QUEUES.normal;
+        await redisClient.lpush(queueName, orphan._id.toString());
+
+        console.log(`${tag} Rescued — re-enqueued to ${queueName} (attempt ${orphan.retryCount}/${orphan.maxRetries + 1})`);
+
+      } else {
+        // No retries left — move to DLQ
+        orphan.status      = "DEAD";
+        orphan.error       = "Worker crashed or timed out (lease expired) — retries exhausted";
+        orphan.deadAt      = new Date();
+        orphan.completedAt = new Date();
+        orphan.leasedUntil = null;
+        orphan.leasedBy    = null;
+        await orphan.save();
+
+        await redisClient.lpush(DLQ_NAME, orphan._id.toString());
+        console.log(`${tag} Exhausted — moved to DLQ: ${DLQ_NAME}`);
+      }
+
+    } catch (err) {
+      console.error(`${tag} Error during reap cycle:`, err.message);
+    }
+  }
+};
+
+// ─── Single Worker Slot ───────────────────────────────────────────────────────
+
+const runSlot = async (slotId, slotType, redisClient) => {
   const { label, queues } = SLOT_TYPES[slotType];
-  const client = createRedisClient();
-
-  // Log prefix includes worker ID + slot — identifies machine AND slot
-  // Example: [a3f2c1b4][Slot 1][HIGH]
   const tag = `[${WORKER_ID}][Slot ${slotId}][${label}]`;
+  const listenOn = queues.map((q) => q.replace("taskflow:jobs:", "")).join(" -> ");
 
-  const listeningSummary = queues.map((q) => q.replace("taskflow:jobs:", "")).join(" -> ");
-  console.log(`${tag} Ready — listening: ${listeningSummary}`);
+  console.log(`${tag} Ready — listening: ${listenOn}`);
 
   while (true) {
     try {
-      const result    = await client.brpop(...queues, 0);
+      const result    = await redisClient.brpop(...queues, 0);
       const fromQueue = result[0];
       const jobId     = result[1];
 
       console.log(`\n${tag} ─────────────────────────────────`);
-      console.log(`${tag} Received: ${jobId}`);
-      console.log(`${tag} From:     ${fromQueue}`);
+      console.log(`${tag} Received: ${jobId} from ${fromQueue}`);
 
-      const job = await Job.findById(jobId);
-      if (!job) {
-        console.warn(`${tag} Job not found: ${jobId} - skipping.`);
-        continue;
-      }
+      // Atomically acquire the lease — prevents double-processing
+      const job = await acquireLease(jobId, tag);
+      if (!job) continue; // another worker/slot already has it
 
-      job.status    = "PROCESSING";
-      job.startedAt = new Date();
-      await job.save();
       console.log(`${tag} Priority: ${job.priority.toUpperCase()} | Attempt: ${job.retryCount + 1}/${job.maxRetries + 1}`);
 
       try {
@@ -130,6 +266,7 @@ const runSlot = async (slotId, slotType) => {
         job.result      = jobResult;
         job.completedAt = new Date();
         await job.save();
+        await releaseLease(job._id);
         console.log(`${tag} COMPLETED: ${job._id}`);
 
       } catch (processingError) {
@@ -139,14 +276,14 @@ const runSlot = async (slotId, slotType) => {
           job.retryCount += 1;
           job.status      = "QUEUED";
           await job.save();
+          await releaseLease(job._id);
 
           const delay     = getBackoffDelay(job.retryCount);
           const requeueTo = QUEUES[job.priority] || QUEUES.normal;
-
           console.error(`${tag} FAILED: ${processingError.message}`);
           console.log(`${tag} Retry ${job.retryCount}/${job.maxRetries} in ${delay / 1000}s -> ${requeueTo}`);
           await sleep(delay);
-          await client.lpush(requeueTo, job._id.toString());
+          await redisClient.lpush(requeueTo, job._id.toString());
 
         } else {
           job.status      = "DEAD";
@@ -154,8 +291,8 @@ const runSlot = async (slotId, slotType) => {
           job.deadAt      = new Date();
           job.completedAt = new Date();
           await job.save();
-
-          await client.lpush(DLQ_NAME, job._id.toString());
+          await releaseLease(job._id);
+          await redisClient.lpush(DLQ_NAME, job._id.toString());
           console.error(`${tag} DEAD (all ${job.maxRetries + 1} attempts exhausted): ${job._id}`);
         }
       }
@@ -170,6 +307,7 @@ const runSlot = async (slotId, slotType) => {
 };
 
 // ─── Main Entry Point ─────────────────────────────────────────────────────────
+
 const runWorker = async () => {
   const slotsHigh   = parseInt(process.env.WORKER_SLOTS_HIGH,   10) || 3;
   const slotsNormal = parseInt(process.env.WORKER_SLOTS_NORMAL, 10) || 2;
@@ -177,22 +315,28 @@ const runWorker = async () => {
   const totalSlots  = slotsHigh + slotsNormal + slotsLow;
 
   console.log(`[WORKER] ========================================`);
-  console.log(`[WORKER] Worker ID:   ${WORKER_ID}  (Docker hostname)`);
-  console.log(`[WORKER] Slot pool:   ${slotsHigh} HIGH + ${slotsNormal} NORMAL + ${slotsLow} LOW = ${totalSlots} slots`);
-  console.log(`[WORKER] HIGH slots:  high -> normal -> low`);
-  console.log(`[WORKER] NORMAL slots: normal -> low`);
-  console.log(`[WORKER] LOW slots:   low only`);
+  console.log(`[WORKER] Worker ID:     ${WORKER_ID}`);
+  console.log(`[WORKER] Slot pool:     ${slotsHigh} HIGH + ${slotsNormal} NORMAL + ${slotsLow} LOW = ${totalSlots} slots`);
+  console.log(`[WORKER] Lease TTL:     ${LEASE_DURATION_MS / 1000}s`);
+  console.log(`[WORKER] Reaper every:  ${REAPER_INTERVAL_MS / 1000}s`);
   console.log(`[WORKER] ========================================`);
 
   await connectDB();
 
+  // One shared Redis client for the reaper (it only does writes, no BRPOP)
+  const reaperClient = createRedisClient();
+
+  // Each slot gets its own dedicated Redis client for BRPOP
   const slots = [];
   let slotId  = 1;
-  for (let i = 0; i < slotsHigh;   i++) slots.push(runSlot(slotId++, "high"));
-  for (let i = 0; i < slotsNormal; i++) slots.push(runSlot(slotId++, "normal"));
-  for (let i = 0; i < slotsLow;    i++) slots.push(runSlot(slotId++, "low"));
+  for (let i = 0; i < slotsHigh;   i++) slots.push(runSlot(slotId++, "high",   createRedisClient()));
+  for (let i = 0; i < slotsNormal; i++) slots.push(runSlot(slotId++, "normal", createRedisClient()));
+  for (let i = 0; i < slotsLow;    i++) slots.push(runSlot(slotId++, "low",    createRedisClient()));
 
-  console.log(`[WORKER] ${totalSlots} slot(s) launched. Waiting for jobs...`);
+  // Reaper runs alongside all slots
+  slots.push(runReaper(reaperClient));
+
+  console.log(`[WORKER] ${totalSlots} slot(s) + 1 reaper launched. Waiting for jobs...`);
   await Promise.all(slots);
 };
 
