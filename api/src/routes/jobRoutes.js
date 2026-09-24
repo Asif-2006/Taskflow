@@ -1,26 +1,39 @@
 /**
- * jobRoutes.js — URL → Handler Mapping
+ * jobRoutes.js - URL to Handler Mapping
  *
- * This file's only job is to say:
- *   "When someone hits THIS URL with THIS method, call THAT function."
+ * Route ORDER matters in Express:
+ *   1. Specific static paths first  (/dead, /)
+ *   2. Dynamic param paths last     (/:id, /:id/requeue)
  *
- * It contains zero business logic.
- *
- * Express Router lets us group related routes together and
- * mount them all under a prefix (e.g. /api/jobs) in server.js.
+ * If /:id came before /dead, Express would treat "dead" as a job ID.
+ * If /:id came before /, GET / would still work (/ has no param), but
+ * declaring the more-specific routes first is always safer practice.
  */
 
 const express = require("express");
-const router = express.Router();
-const { createJob, getJob } = require("../controllers/jobController");
+const router  = express.Router();
+const {
+  createJob,
+  getJob,
+  listJobs,
+  listDead,
+  requeueJob,
+} = require("../controllers/jobController");
 
-// POST /api/jobs    → createJob()
-// This is how a client submits a new job to the system.
+// POST /api/jobs           -> submit a new job
 router.post("/", createJob);
 
-// GET /api/jobs/:id → getJob()
-// This is how a client checks the status of a job.
-// :id is a URL parameter — Express puts it in req.params.id
+// GET  /api/jobs           -> list/filter all jobs (with pagination)
+router.get("/",  listJobs);
+
+// GET  /api/jobs/dead      -> list all DEAD jobs
+// Must be before /:id so "dead" is not treated as a job ID
+router.get("/dead", listDead);
+
+// GET  /api/jobs/:id       -> get a single job by ID
 router.get("/:id", getJob);
+
+// POST /api/jobs/:id/requeue -> bring a DEAD job back to life
+router.post("/:id/requeue", requeueJob);
 
 module.exports = router;

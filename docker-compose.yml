@@ -1,19 +1,20 @@
 services:
-  # ─────────────────────────────────────────
-  # Redis — job queue (temporary courier)
+  # -----------------------------------------
+  # Redis - job queue (temporary courier)
   # MongoDB is hosted on Atlas (cloud), not here.
-  # ─────────────────────────────────────────
+  # -----------------------------------------
   redis:
     image: redis:7-alpine
     container_name: taskflow-redis
     ports:
-      - "6380:6379"         # Host:6380 → Container:6379 (avoids clash with local Redis)
+      - "6380:6379"
     networks:
       - taskflow-network
 
-  # ─────────────────────────────────────────
-  # API Server — receives job submissions
-  # ─────────────────────────────────────────
+  # -----------------------------------------
+  # API Server - receives job submissions
+  # container_name is fixed - only one API instance
+  # -----------------------------------------
   api:
     build:
       context: ./api
@@ -22,7 +23,6 @@ services:
     ports:
       - "3001:3000"
     environment:
-      # ${MONGODB_URI} reads from your .env file automatically
       - MONGODB_URI=${MONGODB_URI}
       - REDIS_URL=redis://redis:6379
       - PORT=3000
@@ -34,17 +34,33 @@ services:
       - ./api:/app
       - /app/node_modules
 
-  # ─────────────────────────────────────────
-  # Worker — processes jobs from the queue
-  # ─────────────────────────────────────────
+  # -----------------------------------------
+  # Worker - distributed job processor
+  #
+  # NO container_name here — this allows scaling:
+  #   docker-compose up --scale worker=3
+  #   -> runs 3 independent worker containers
+  #   -> each with its own slot pool
+  #   -> all sharing the same Redis queues + MongoDB
+  #
+  # Slot pool per worker instance:
+  #   WORKER_SLOTS_HIGH=3   -> 3 slots prefer high
+  #   WORKER_SLOTS_NORMAL=2 -> 2 slots prefer normal
+  #   WORKER_SLOTS_LOW=1    -> 1 slot for low
+  #
+  # With 3 worker instances: 18 total parallel processors
+  # If one worker crashes: others continue (fault tolerant)
+  # -----------------------------------------
   worker:
     build:
       context: ./worker
       dockerfile: Dockerfile
-    container_name: taskflow-worker
     environment:
       - MONGODB_URI=${MONGODB_URI}
       - REDIS_URL=redis://redis:6379
+      - WORKER_SLOTS_HIGH=3
+      - WORKER_SLOTS_NORMAL=2
+      - WORKER_SLOTS_LOW=1
     depends_on:
       - redis
     networks:
@@ -53,10 +69,9 @@ services:
       - ./worker:/app
       - /app/node_modules
 
-# ─────────────────────────────────────────
-# Shared network — containers communicate
-# by service name, not localhost
-# ─────────────────────────────────────────
+# -----------------------------------------
+# Shared network
+# -----------------------------------------
 networks:
   taskflow-network:
     driver: bridge

@@ -1,161 +1,205 @@
 /**
- * worker.js — The Worker Process
+ * worker.js - The Worker Process (Phase 2: Retries + DLQ + Priorities + Weighted Concurrency)
  *
- * This is the entry point for the Worker.
- * It runs completely independently from the API (separate Node.js process).
+ * DISTRIBUTED DESIGN:
+ *   Run multiple independent worker CONTAINERS using:
+ *     docker-compose up --scale worker=3
  *
- * THE CORE LOOP:
- *   1. Connect to MongoDB and Redis
- *   2. Block on BRPOP — wait for a job ID to appear in Redis
- *   3. When a job ID arrives, fetch the full job from MongoDB
- *   4. Update status to PROCESSING
- *   5. Run the job processor
- *   6. Update status to COMPLETED (or FAILED)
- *   7. Go back to step 2 immediately
+ *   Each container:
+ *     - Is a completely separate Node.js process (separate machine in prod)
+ *     - Has its own slot pool (3 HIGH + 2 NORMAL + 1 LOW = 6 slots)
+ *     - Has its own Redis connections (6 BRPOP connections per container)
+ *     - Shares the same Redis queues and MongoDB as all other workers
  *
- * The Worker never stops unless the process is killed.
- * It processes one job at a time (simple, predictable, easy to understand).
+ *   Redis BRPOP is atomic — only ONE worker across ALL containers can
+ *   receive any given job. No duplicates. No race conditions.
+ *
+ *   With 3 worker containers: 18 parallel job processors total
+ *   If one container crashes: the other two continue unaffected
+ *
+ * WEIGHTED SLOT POOL (per container):
+ *   HIGH slots   (3): BRPOP high -> normal -> low
+ *   NORMAL slots (2): BRPOP normal -> low
+ *   LOW slots    (1): BRPOP low
+ *
+ * WORKER IDENTITY:
+ *   Each container gets a unique Docker hostname (e.g. "a3f2c1b4").
+ *   All log lines are prefixed with [workerID] so you can trace
+ *   which physical worker handled which job across distributed instances.
+ *
+ * Controlled via env vars in docker-compose.yml:
+ *   WORKER_SLOTS_HIGH=3
+ *   WORKER_SLOTS_NORMAL=2
+ *   WORKER_SLOTS_LOW=1
  */
 
 require("dotenv").config();
 
+const os      = require("os");
 const connectDB = require("./config/db");
 const { createRedisClient } = require("./config/redis");
 const { processJob } = require("./jobs/jobProcessor");
-
-// We require the Job model here — the Worker needs it to:
-//   - Find a job by ID (Job.findById)
-//   - Update job status (job.save)
-// This is a copy of the same schema as the API — both processes
-// talk to the SAME MongoDB collection, just through separate connections.
 const mongoose = require("mongoose");
 
-// ─── Job Model (inline for the worker) ───────────────────────────────────────
-// We define the schema again here rather than sharing files between api/ and worker/.
-// This keeps the two services independent — they only share MongoDB as a contract.
+// Unique identity for this worker instance.
+// Docker assigns each container a unique hostname (short UUID).
+// Shows up in every log line so you know WHICH machine processed the job.
+const WORKER_ID = os.hostname().slice(0, 8);
+
+// ─── Job Model ────────────────────────────────────────────────────────────────
 const jobSchema = new mongoose.Schema(
   {
-    type: String,
-    payload: mongoose.Schema.Types.Mixed,
+    type:     String,
+    payload:  mongoose.Schema.Types.Mixed,
+    priority: { type: String, enum: ["high", "normal", "low"], default: "normal" },
     status: {
-      type: String,
-      enum: ["QUEUED", "PROCESSING", "COMPLETED", "FAILED"],
+      type:    String,
+      enum:    ["QUEUED", "PROCESSING", "COMPLETED", "FAILED", "DEAD"],
       default: "QUEUED",
     },
-    result: { type: mongoose.Schema.Types.Mixed, default: null },
-    error: { type: String, default: null },
-    startedAt: { type: Date, default: null },
+    result:     { type: mongoose.Schema.Types.Mixed, default: null },
+    error:      { type: String, default: null },
+    retryCount: { type: Number, default: 0 },
+    maxRetries: { type: Number, default: 3 },
+    lastError:  { type: String, default: null },
+    startedAt:   { type: Date, default: null },
     completedAt: { type: Date, default: null },
+    deadAt:      { type: Date, default: null },
   },
   { timestamps: true }
 );
 
 const Job = mongoose.model("Job", jobSchema);
 
-// ─── Queue config ─────────────────────────────────────────────────────────────
-const QUEUE_NAME = "taskflow:jobs";
+// ─── Queue names ──────────────────────────────────────────────────────────────
+const QUEUES = {
+  high:   "taskflow:jobs:high",
+  normal: "taskflow:jobs:normal",
+  low:    "taskflow:jobs:low",
+};
+const DLQ_NAME = "taskflow:dead";
 
-// ─── Main Worker Loop ─────────────────────────────────────────────────────────
+// ─── Slot type definitions ────────────────────────────────────────────────────
+const SLOT_TYPES = {
+  high:   { label: "HIGH",   queues: [QUEUES.high, QUEUES.normal, QUEUES.low] },
+  normal: { label: "NORMAL", queues: [QUEUES.normal, QUEUES.low] },
+  low:    { label: "LOW",    queues: [QUEUES.low] },
+};
 
-const runWorker = async () => {
-  console.log("[WORKER] TaskFlow Worker starting...");
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const getBackoffDelay = (retryCount) => Math.min(Math.pow(2, retryCount) * 1000, 30000);
 
-  // Step 1: Connect to MongoDB (must succeed before we start processing)
-  await connectDB();
+// ─── Single Slot ──────────────────────────────────────────────────────────────
+const runSlot = async (slotId, slotType) => {
+  const { label, queues } = SLOT_TYPES[slotType];
+  const client = createRedisClient();
 
-  // Step 2: Create a dedicated Redis client for blocking operations
-  // This client will be held open by BRPOP — it cannot do anything else.
-  const redisClient = createRedisClient();
+  // Log prefix includes worker ID + slot — identifies machine AND slot
+  // Example: [a3f2c1b4][Slot 1][HIGH]
+  const tag = `[${WORKER_ID}][Slot ${slotId}][${label}]`;
 
-  console.log("[WORKER] Waiting for jobs... (press Ctrl+C to stop)");
-  console.log(`[WORKER] Listening on Redis queue: ${QUEUE_NAME}`);
+  const listeningSummary = queues.map((q) => q.replace("taskflow:jobs:", "")).join(" -> ");
+  console.log(`${tag} Ready — listening: ${listeningSummary}`);
 
-  // Step 3: The infinite loop
-  // This loop never exits unless the process is killed.
   while (true) {
     try {
-      // ── BRPOP: Block until a job ID arrives ──────────────────────────────
-      // This is the key command. The Worker sleeps here, using 0 CPU,
-      // until Redis receives an LPUSH from the API.
-      //
-      // BRPOP returns: ["taskflow:jobs", "jobId123..."]
-      // We only need index [1] (the actual job ID).
-      //
-      // timeout = 0 means: wait forever. Never time out.
-      const result = await redisClient.brpop(QUEUE_NAME, 0);
-      const jobId = result[1];
+      const result    = await client.brpop(...queues, 0);
+      const fromQueue = result[0];
+      const jobId     = result[1];
 
-      console.log(`\n[WORKER] ──────────────────────────────────────`);
-      console.log(`[WORKER] Received job: ${jobId}`);
+      console.log(`\n${tag} ─────────────────────────────────`);
+      console.log(`${tag} Received: ${jobId}`);
+      console.log(`${tag} From:     ${fromQueue}`);
 
-      // ── Fetch the full job document from MongoDB ──────────────────────────
       const job = await Job.findById(jobId);
-
       if (!job) {
-        // This can happen if MongoDB was cleared but Redis wasn't.
-        // Safe to skip — just log and move on.
-        console.warn(`[WORKER] Job not found in MongoDB: ${jobId} — skipping.`);
+        console.warn(`${tag} Job not found: ${jobId} - skipping.`);
         continue;
       }
 
-      // ── Mark as PROCESSING ────────────────────────────────────────────────
-      // Anyone querying GET /api/jobs/:id will now see "PROCESSING".
-      // This happens BEFORE the actual work starts.
-      job.status = "PROCESSING";
+      job.status    = "PROCESSING";
       job.startedAt = new Date();
       await job.save();
-      console.log(`[WORKER] Job status: PROCESSING`);
+      console.log(`${tag} Priority: ${job.priority.toUpperCase()} | Attempt: ${job.retryCount + 1}/${job.maxRetries + 1}`);
 
-      // ── Do the actual work ────────────────────────────────────────────────
-      // processJob() routes to the correct handler based on job.type.
-      // If it throws, we catch it below and mark the job as FAILED.
       try {
-        const result = await processJob(job);
+        const jobResult = await processJob(job);
 
-        // ── Success: mark as COMPLETED ──────────────────────────────────────
-        job.status = "COMPLETED";
-        job.result = result;
+        job.status      = "COMPLETED";
+        job.result      = jobResult;
         job.completedAt = new Date();
         await job.save();
-        console.log(`[WORKER] Job completed: ${job._id}`);
-        console.log(`[WORKER] Result: ${JSON.stringify(result)}`);
+        console.log(`${tag} COMPLETED: ${job._id}`);
 
       } catch (processingError) {
-        // ── Failure: mark as FAILED ─────────────────────────────────────────
-        // The error message is stored in MongoDB so the client can see it.
-        job.status = "FAILED";
-        job.error = processingError.message;
-        job.completedAt = new Date();
-        await job.save();
-        console.error(`[WORKER] Job FAILED: ${job._id}`);
-        console.error(`[WORKER] Error: ${processingError.message}`);
+        job.lastError = processingError.message;
+
+        if (job.retryCount < job.maxRetries) {
+          job.retryCount += 1;
+          job.status      = "QUEUED";
+          await job.save();
+
+          const delay     = getBackoffDelay(job.retryCount);
+          const requeueTo = QUEUES[job.priority] || QUEUES.normal;
+
+          console.error(`${tag} FAILED: ${processingError.message}`);
+          console.log(`${tag} Retry ${job.retryCount}/${job.maxRetries} in ${delay / 1000}s -> ${requeueTo}`);
+          await sleep(delay);
+          await client.lpush(requeueTo, job._id.toString());
+
+        } else {
+          job.status      = "DEAD";
+          job.error       = processingError.message;
+          job.deadAt      = new Date();
+          job.completedAt = new Date();
+          await job.save();
+
+          await client.lpush(DLQ_NAME, job._id.toString());
+          console.error(`${tag} DEAD (all ${job.maxRetries + 1} attempts exhausted): ${job._id}`);
+        }
       }
 
-      console.log(`[WORKER] ──────────────────────────────────────\n`);
+      console.log(`${tag} ─────────────────────────────────\n`);
 
     } catch (err) {
-      // Outer catch: handles unexpected errors (e.g., Redis disconnect).
-      // We log and continue — the Worker should never crash from a bad job.
-      console.error("[WORKER] Unexpected error in loop:", err.message);
-      // Brief pause before retrying to avoid a tight crash loop
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      console.error(`${tag} Unexpected error:`, err.message);
+      await sleep(1000);
     }
   }
 };
 
-// ─── Graceful Shutdown ────────────────────────────────────────────────────────
-process.on("SIGTERM", () => {
-  console.log("[WORKER] Received SIGTERM, shutting down gracefully...");
-  process.exit(0);
-});
+// ─── Main Entry Point ─────────────────────────────────────────────────────────
+const runWorker = async () => {
+  const slotsHigh   = parseInt(process.env.WORKER_SLOTS_HIGH,   10) || 3;
+  const slotsNormal = parseInt(process.env.WORKER_SLOTS_NORMAL, 10) || 2;
+  const slotsLow    = parseInt(process.env.WORKER_SLOTS_LOW,    10) || 1;
+  const totalSlots  = slotsHigh + slotsNormal + slotsLow;
 
-process.on("SIGINT", () => {
-  console.log("[WORKER] Received SIGINT (Ctrl+C), shutting down...");
-  process.exit(0);
-});
+  console.log(`[WORKER] ========================================`);
+  console.log(`[WORKER] Worker ID:   ${WORKER_ID}  (Docker hostname)`);
+  console.log(`[WORKER] Slot pool:   ${slotsHigh} HIGH + ${slotsNormal} NORMAL + ${slotsLow} LOW = ${totalSlots} slots`);
+  console.log(`[WORKER] HIGH slots:  high -> normal -> low`);
+  console.log(`[WORKER] NORMAL slots: normal -> low`);
+  console.log(`[WORKER] LOW slots:   low only`);
+  console.log(`[WORKER] ========================================`);
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+  await connectDB();
+
+  const slots = [];
+  let slotId  = 1;
+  for (let i = 0; i < slotsHigh;   i++) slots.push(runSlot(slotId++, "high"));
+  for (let i = 0; i < slotsNormal; i++) slots.push(runSlot(slotId++, "normal"));
+  for (let i = 0; i < slotsLow;    i++) slots.push(runSlot(slotId++, "low"));
+
+  console.log(`[WORKER] ${totalSlots} slot(s) launched. Waiting for jobs...`);
+  await Promise.all(slots);
+};
+
+process.on("SIGTERM", () => { console.log(`[${WORKER_ID}] SIGTERM - shutting down...`); process.exit(0); });
+process.on("SIGINT",  () => { console.log(`[${WORKER_ID}] SIGINT - shutting down...`);  process.exit(0); });
+
 runWorker().catch((err) => {
-  console.error("[WORKER] Fatal startup error:", err.message);
+  console.error(`[${WORKER_ID}] Fatal startup error:`, err.message);
   process.exit(1);
 });

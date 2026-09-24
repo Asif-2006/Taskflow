@@ -1,80 +1,112 @@
 /**
- * queueService.js — Redis Queue Operations
+ * queueService.js - Redis Queue Operations
  *
- * This is the ONLY place in the codebase that knows HOW the queue works.
- * The controller doesn't know or care that we're using Redis.
- * It just calls enqueue() and dequeue().
+ * Phase 2 - Step 3: Three priority queues
  *
- * WHY a service file?
- *   If we ever change the queue implementation (e.g., switch from Redis Lists
- *   to Redis Streams), we only change THIS file. Nothing else changes.
+ * Active queues (checked by Worker in this order):
+ *   taskflow:jobs:high    <- high priority jobs
+ *   taskflow:jobs:normal  <- default jobs
+ *   taskflow:jobs:low     <- low priority jobs
  *
- * ─── The Queue ────────────────────────────────────────────────────────────────
+ * Dead Letter Queue:
+ *   taskflow:dead         <- jobs that exhausted all retries
  *
- * Data structure: Redis List
- * Queue name:     "taskflow:jobs"
- *
- * Visual:
- *
- *   LPUSH (new jobs go here)       BRPOP (worker picks up from here)
- *          ↓                                    ↓
- *   [jobId5, jobId4, jobId3, jobId2, jobId1]
- *
- *   FIFO — jobId1 was added first, so it gets processed first.
- *
- * ─── Commands used ────────────────────────────────────────────────────────────
- *
- *   LPUSH taskflow:jobs <jobId>
- *     → Pushes jobId to the LEFT (tail) of the list.
- *     → Used by: API (Step 5)
- *
- *   BRPOP taskflow:jobs 0
- *     → Blocking pop from the RIGHT (head) of the list.
- *     → If the list is empty, Redis makes the caller WAIT (sleep)
- *       until a new item appears. This is extremely efficient —
- *       the Worker process uses 0% CPU while waiting.
- *     → Used by: Worker (Step 6)
- *
- * ─────────────────────────────────────────────────────────────────────────────
+ * HOW PRIORITY WORKS:
+ *   BRPOP accepts multiple queue names and checks them left to right.
+ *   It returns from the FIRST non-empty queue it finds.
+ *   So "high" is always checked before "normal", "normal" before "low".
+ *   No extra code needed - Redis does the prioritization natively.
  */
 
 const redisClient = require("../config/redis");
 
-// The name of our queue in Redis.
-// Using a colon prefix ("taskflow:") is a Redis naming convention
-// for grouping related keys (like a namespace).
-const QUEUE_NAME = "taskflow:jobs";
+// The three priority queues - ORDER MATTERS here (used in Worker BRPOP)
+const QUEUES = {
+  high:   "taskflow:jobs:high",
+  normal: "taskflow:jobs:normal",
+  low:    "taskflow:jobs:low",
+};
+
+// Dead Letter Queue
+const DLQ_NAME = "taskflow:dead";
 
 /**
- * enqueue(jobId)
- * Adds a job ID to the back of the queue.
- * Called by the API after creating a job in MongoDB.
- *
- * Redis command: LPUSH taskflow:jobs <jobId>
- * Returns: the new length of the list
+ * getQueueName(priority)
+ * Returns the Redis key for the given priority level.
+ * Falls back to "normal" for any unrecognised value.
  */
-const enqueue = async (jobId) => {
-  await redisClient.lpush(QUEUE_NAME, jobId.toString());
-  console.log(`[API] Job enqueued in Redis: ${jobId}`);
+const getQueueName = (priority) => {
+  return QUEUES[priority] || QUEUES.normal;
 };
 
 /**
- * dequeue()
- * Removes and returns the oldest job ID from the queue.
- * BLOCKS (waits) if the queue is empty — no busy-looping needed.
- * Called by the Worker in an infinite loop.
+ * enqueue(jobId, priority)
+ * Pushes a job ID into the correct priority queue.
+ * Called by the API after saving to MongoDB.
  *
- * Redis command: BRPOP taskflow:jobs 0
- * Returns: the job ID string, or null if interrupted
+ * Redis command: LPUSH taskflow:jobs:<priority> <jobId>
+ */
+const enqueue = async (jobId, priority = "normal") => {
+  const queueName = getQueueName(priority);
+  await redisClient.lpush(queueName, jobId.toString());
+  console.log(`[API] Job enqueued -> ${queueName}: ${jobId}`);
+};
+
+/**
+ * enqueueDead(jobId)
+ * Pushes a job ID into the Dead Letter Queue.
+ * Called by the Worker when all retries are exhausted.
+ */
+const enqueueDead = async (jobId) => {
+  await redisClient.lpush(DLQ_NAME, jobId.toString());
+  console.log(`[QUEUE] Job moved to DLQ -> ${DLQ_NAME}: ${jobId}`);
+};
+
+/**
+ * dequeue(client)
+ * Blocking pop - checks HIGH then NORMAL then LOW in order.
+ * Returns the job ID string from whichever queue had something.
  *
- * NOTE: BRPOP returns [queueName, value] — we only want the value (index 1).
+ * Redis command: BRPOP taskflow:jobs:high taskflow:jobs:normal taskflow:jobs:low 0
+ *
+ * Return value: ["taskflow:jobs:high", "jobId123"] - we return both
+ * so the caller knows which queue it came from (useful for logging).
  */
 const dequeue = async (client) => {
-  // We accept a separate client here because BRPOP holds the connection open
-  // while waiting. We don't want to block the shared client used for LPUSH.
-  const result = await client.brpop(QUEUE_NAME, 0);
+  const result = await client.brpop(
+    QUEUES.high,
+    QUEUES.normal,
+    QUEUES.low,
+    0 // timeout=0 means wait forever
+  );
   if (!result) return null;
-  return result[1]; // result = ["taskflow:jobs", "jobId123"]
+  // result = ["taskflow:jobs:high", "jobId123"]
+  return { queueName: result[0], jobId: result[1] };
 };
 
-module.exports = { enqueue, dequeue, QUEUE_NAME };
+/**
+ * getDead()
+ * Returns all job IDs currently sitting in the DLQ.
+ */
+const getDead = async () => {
+  return await redisClient.lrange(DLQ_NAME, 0, -1);
+};
+
+/**
+ * removeFromDead(jobId)
+ * Removes a specific job ID from the DLQ.
+ * Called when admin requeues a dead job.
+ */
+const removeFromDead = async (jobId) => {
+  await redisClient.lrem(DLQ_NAME, 0, jobId.toString());
+};
+
+module.exports = {
+  enqueue,
+  enqueueDead,
+  dequeue,
+  getDead,
+  removeFromDead,
+  QUEUES,
+  DLQ_NAME,
+};

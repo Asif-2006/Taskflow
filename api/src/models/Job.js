@@ -1,97 +1,79 @@
 /**
- * Job.js — Mongoose Job Model
+ * Job.js - Mongoose Job Model
  *
- * This defines the SCHEMA for a job document in MongoDB.
- *
- * WHY a schema?
- *   MongoDB is schema-less by default — you can store anything.
- *   Mongoose adds a schema layer so we get:
- *     - Validation (required fields, allowed values)
- *     - Defaults (status starts as "QUEUED" automatically)
- *     - Type safety (payload is always an Object, not a string)
- *
- * WHAT is this collection called in MongoDB?
- *   Mongoose automatically pluralizes the model name.
- *   "Job" → stored in the "jobs" collection.
+ * Phase 2 fields added:
+ *   - priority   (Step 3): high / normal / low
+ *   - retryCount (Step 1): current retry attempt
+ *   - maxRetries (Step 1): retry ceiling
+ *   - lastError  (Step 1): most recent failure message
+ *   - deadAt     (Step 2): when job entered DLQ
  */
 
 const mongoose = require("mongoose");
 
-// ─── Schema Definition ────────────────────────────────────────────────────────
-
 const jobSchema = new mongoose.Schema(
   {
-    // ── What kind of job is this? ──────────────────────────────────────────
-    // Examples: "example", "send-email", "resize-image", "fail-test"
-    // The Worker will use this to decide HOW to process the job.
+    // What kind of job - Worker routes on this
     type: {
       type: String,
-      required: true, // Must be provided — no type = rejected by Mongoose
+      required: true,
     },
 
-    // ── The input data for this job ────────────────────────────────────────
-    // This is whatever the client sends along with the job.
-    // Example: { message: "Hello TaskFlow" }
-    // We use mongoose.Schema.Types.Mixed so it can be any object shape.
+    // Input data for the job
     payload: {
       type: mongoose.Schema.Types.Mixed,
       default: {},
     },
 
-    // ── Current state of the job ───────────────────────────────────────────
-    // This is the field you'll watch change as the job moves through the system:
-    //
-    //   QUEUED     → API created the job, it's waiting in Redis
-    //   PROCESSING → Worker picked it up and is working on it
-    //   COMPLETED  → Worker finished successfully, result is stored
-    //   FAILED     → Worker threw an error, error message is stored
-    //
+    // Priority - controls which Redis queue this job lands in
+    // Worker checks: high then normal then low (always in that order)
+    //   "high"   -> taskflow:jobs:high   (payments, urgent, user-facing)
+    //   "normal" -> taskflow:jobs:normal (default)
+    //   "low"    -> taskflow:jobs:low    (newsletters, reports, cleanup)
+    priority: {
+      type: String,
+      enum: ["high", "normal", "low"],
+      default: "normal",
+    },
+
+    // Current state of the job
+    //   QUEUED     -> waiting in Redis
+    //   PROCESSING -> Worker picked it up
+    //   COMPLETED  -> finished successfully
+    //   FAILED     -> exhausted all retries (or maxRetries = 0)
+    //   DEAD       -> moved to Dead Letter Queue
     status: {
       type: String,
-      enum: ["QUEUED", "PROCESSING", "COMPLETED", "FAILED"],
+      enum: ["QUEUED", "PROCESSING", "COMPLETED", "FAILED", "DEAD"],
       default: "QUEUED",
     },
 
-    // ── Output of a successfully completed job ─────────────────────────────
-    // Null until the Worker completes the job.
-    // Example: { message: "Job processed successfully" }
+    // Output of a successfully completed job
     result: {
       type: mongoose.Schema.Types.Mixed,
       default: null,
     },
 
-    // ── Error message if the job fails ─────────────────────────────────────
-    // Null unless the Worker throws an error.
+    // Final error message (permanent FAILED or DEAD)
     error: {
       type: String,
       default: null,
     },
 
-    // ── Timestamps ─────────────────────────────────────────────────────────
-    // createdAt  → Set automatically when the API creates the job
-    // startedAt  → Set by the Worker when it picks the job up from Redis
-    // completedAt → Set by the Worker when it finishes (success or failure)
-    startedAt: {
-      type: Date,
-      default: null,
-    },
+    // Retry tracking
+    retryCount: { type: Number, default: 0 },
+    maxRetries: { type: Number, default: 3 },
+    lastError:  { type: String, default: null }, // error from most recent attempt
 
-    completedAt: {
-      type: Date,
-      default: null,
-    },
+    // Timestamps
+    startedAt:   { type: Date, default: null },
+    completedAt: { type: Date, default: null },
+    deadAt:      { type: Date, default: null },
   },
   {
-    // Mongoose option: automatically add createdAt and updatedAt fields.
-    // We get createdAt for free this way.
-    timestamps: true,
+    timestamps: true, // auto-adds createdAt, updatedAt
   }
 );
-
-// ─── Export Model ─────────────────────────────────────────────────────────────
-// mongoose.model("Job", jobSchema) creates a Model class.
-// A Model is a class that lets you create, read, update, delete documents.
-// It maps to the "jobs" collection in MongoDB.
 
 const Job = mongoose.model("Job", jobSchema);
 
