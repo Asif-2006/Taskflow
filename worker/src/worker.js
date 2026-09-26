@@ -75,7 +75,7 @@ const jobSchema = new mongoose.Schema(
     lastError:      { type: String, default: null },
     leasedUntil:    { type: Date,   default: null },
     leasedBy:       { type: String, default: null },
-    idempotencyKey: { type: String, default: null },
+    idempotencyKey: { type: String },
     startedAt:      { type: Date,   default: null },
     completedAt:    { type: Date,   default: null },
     deadAt:         { type: Date,   default: null },

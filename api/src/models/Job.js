@@ -97,7 +97,6 @@ const jobSchema = new mongoose.Schema(
     //
     idempotencyKey: {
       type: String,
-      default: null,
     },
 
     // Timestamps

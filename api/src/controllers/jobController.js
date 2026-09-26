@@ -74,7 +74,7 @@ const createJob = async (req, res) => {
     });
   } catch (error) {
     // MongoDB duplicate key error on idempotencyKey (race condition safety net)
-    if (error.code === 11000) {
+    if (error.code === 11000 && req.body.idempotencyKey) {
       const existing = await Job.findOne({ idempotencyKey: req.body.idempotencyKey });
       if (existing) {
         return res.status(200).json({
